@@ -11,6 +11,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from module import SIGReg
+from token_jepa import g1_losses
 from utils import get_column_normalizer, get_img_preprocessor, SaveCkptCallback
 
 
@@ -43,6 +44,43 @@ def lejepa_forward(self, batch, stage, cfg):
     losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
+
+def token_forward(self, batch, stage, cfg):
+    """Token-level models (dense / res / g1). Same data, encoder and SIGReg weight as LeWM."""
+
+    ctx_len = cfg.history_size
+    n_preds = cfg.num_preds
+    lambd = cfg.loss.sigreg.weight
+
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    output = self.model.encode(batch)
+    emb = output["emb"]  # (B, T, N, D)
+    act_emb = output["act_emb"]
+
+    ctx_emb = emb[:, :ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
+    tgt_emb = emb[:, n_preds:]
+    aux = self.model.predict_aux(ctx_emb, ctx_act)
+
+    if self.model.mode == "g1":
+        output["pred_loss"], stats = g1_losses(self.model, ctx_emb, tgt_emb, aux, cfg.g1)
+        output.update(stats)
+    else:
+        output["pred_loss"] = (aux["s_next"] - tgt_emb).pow(2).mean()
+
+    # SIGReg on tokens. Its statistic is multiplied by the sample count, so we subsample k tokens per
+    # time step and rescale by B / k: the regulariser keeps the same strength as LeWM's (B samples).
+    B, T, N, D = emb.shape
+    tok = emb.transpose(0, 1).reshape(T, B * N, D)
+    k = min(cfg.loss.sigreg.get("tokens", 2048), B * N)
+    idx = torch.randperm(B * N, device=tok.device)[:k]
+    output["sigreg_loss"] = self.sigreg(tok[:, idx]) * (B / k)
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+    logs = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k or k.startswith("g1_")}
+    self.log_dict(logs, on_step=True, sync_dist=True)
+    return output
+
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
@@ -97,7 +135,7 @@ def run(cfg):
     world_model = spt.Module(
         model = world_model,
         sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
-        forward=partial(lejepa_forward, cfg=cfg),
+        forward=partial(token_forward if cfg.get("method", "lewm") == "token" else lejepa_forward, cfg=cfg),
         optim=optimizers,
     )
 

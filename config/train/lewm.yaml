@@ -41,3 +41,13 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+
+# ---- token-level models (paper2: sparse residual JEPA) ----
+# method: lewm (original CLS model) | token (model=tok_dense / tok_res / tok_g1)
+method: lewm
+g1:
+  beta: 0.0025        # rate of opening one token, in units of rho^2
+  enc_route: all      # all: closed tokens' residual |c|^2 also trains the encoder
+  lam_dwarm: 1.0      # d fits the stop-grad change on all tokens (cold start)
+  pos_weight: 4.0
+  focus_weight: 1.0   # gate BCE weight, divided by the feature dim D
